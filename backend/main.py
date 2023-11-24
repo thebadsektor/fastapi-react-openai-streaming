@@ -12,6 +12,7 @@ import json
 from pydantic import BaseModel
 import asyncio
 from typing import Generator
+from dotenv import load_dotenv
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 logging.getLogger().addHandler(logging.StreamHandler(stream=sys.stdout))
@@ -47,6 +48,7 @@ app.add_middleware(
 documents = SimpleDirectoryReader("./data").load_data()
 
 # Set up OpenAI API key
+load_dotenv()
 client = openai_api_key = os.environ.get("OPENAI_API_KEY")
 
 # I'm using a cheap GPT-3 model for this demo
@@ -63,31 +65,42 @@ service_context = ServiceContext.from_defaults(
 
 class SearchRequest(BaseModel):
     query: str
+    chunk_size: int = 5  # Default to 1 for per-token streaming
 
 # Global storage for search results
 search_results = []
 
 @app.post("/search")
-async def search(request_data: SearchRequest):  # request_data will be a SearchRequest instance
-    
-    global search_results
-
+async def search(request_data: SearchRequest):
     query = request_data.query
-    # query = "write a short story."
     if not query:
         raise HTTPException(status_code=400, detail="Query parameter is required")
 
-    index = VectorStoreIndex.from_documents(documents, service_context=service_context)  # Assuming docs are already loaded
-    query_engine = index.as_query_engine()
-    response = query_engine.query(query)
+    index = VectorStoreIndex.from_documents(documents, service_context=service_context)
+    query_engine = index.as_query_engine(streaming=True, similarity_top_k=1)
+    streaming_response = query_engine.query(query)
 
-    search_results = [line for line in response.response]
+    async def generate():
+        buffer = ""
+        buffer_length = 0
 
-    return response.response
+        for text in streaming_response.response_gen:
+            buffer += text + " "
+            buffer_length += 1
 
-search("write a short story")
+            # Determine when to yield based on chunk_size
+            if request_data.chunk_size > 0 and buffer_length >= request_data.chunk_size:
+                yield f"data: {buffer.strip()}\n\n".encode('utf-8')
+                buffer = ""
+                buffer_length = 0
+            elif request_data.chunk_size == 0:  # Per-token streaming
+                yield f"data: {text}\n\n".encode('utf-8')
 
-search_results = ['a','b','c']
+        # Send any remaining text in the buffer
+        if buffer:
+            yield f"data: {buffer.strip()}\n\n".encode('utf-8')
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
 
 @app.get("/stream")
 async def stream_data() -> StreamingResponse:
