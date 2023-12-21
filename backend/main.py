@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import StreamingResponse
@@ -11,7 +11,7 @@ import io
 import json
 from pydantic import BaseModel
 import asyncio
-from typing import Generator
+from typing import Generator, List
 from dotenv import load_dotenv
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
@@ -67,49 +67,52 @@ class SearchRequest(BaseModel):
     query: str
     chunk_size: int = 5  # Default to 1 for per-token streaming
 
-# Global storage for search results
-search_results = []
+# WebSocket connection manager
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
 
-@app.post("/search")
-async def search(request_data: SearchRequest):
-    query = request_data.query
-    if not query:
-        raise HTTPException(status_code=400, detail="Query parameter is required")
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
 
-    index = VectorStoreIndex.from_documents(documents, service_context=service_context)
-    query_engine = index.as_query_engine(streaming=True, similarity_top_k=1)
-    streaming_response = query_engine.query(query)
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
 
-    async def generate():
-        buffer = ""
-        buffer_length = 0
+    async def send_personal_message(self, message: str, websocket: WebSocket):
+        await websocket.send_text(message)
 
-        for text in streaming_response.response_gen:
-            buffer += text + " "
-            buffer_length += 1
+manager = ConnectionManager()
 
-            # Determine when to yield based on chunk_size
-            if request_data.chunk_size > 0 and buffer_length >= request_data.chunk_size:
-                yield f"data: {buffer.strip()}\n\n".encode('utf-8')
-                buffer = ""
-                buffer_length = 0
-            elif request_data.chunk_size == 0:  # Per-token streaming
-                yield f"data: {text}\n\n".encode('utf-8')
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket, chunk_size: int = 1):
+    await manager.connect(websocket)
+    try:
+        while True:
+            query = await websocket.receive_text()
+            index = VectorStoreIndex.from_documents(documents, service_context=service_context)
+            query_engine = index.as_query_engine(streaming=True, similarity_top_k=1)
+            streaming_response = query_engine.query(query)
 
-        # Send any remaining text in the buffer
-        if buffer:
-            yield f"data: {buffer.strip()}\n\n".encode('utf-8')
+            buffer = ""
+            buffer_length = 0
 
-    return StreamingResponse(generate(), media_type="text/event-stream")
+            for text in streaming_response.response_gen:
+                buffer += text + " "
+                buffer_length += 1
 
-@app.get("/stream")
-async def stream_data() -> StreamingResponse:
-    async def event_stream() -> Generator:
-        for line in search_results:
-            yield f"data: {line}".encode('utf-8')
-            # await asyncio.sleep(0.1)  # Adjust delay as needed
+                if chunk_size > 0 and buffer_length >= chunk_size:
+                    await manager.send_personal_message(buffer.strip(), websocket)
+                    buffer = ""
+                    buffer_length = 0
+                elif chunk_size == 0:
+                    await manager.send_personal_message(text, websocket)
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+            if buffer:
+                await manager.send_personal_message(buffer.strip(), websocket)
+
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
 
 # Mount the React build folder as a static files directory
 app.mount("/",
